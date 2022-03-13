@@ -1,6 +1,7 @@
 package net.degoes.zio
 
 import zio._
+import java.io.IOException
 
 object ForkJoin extends App {
   import zio.Console._
@@ -97,8 +98,15 @@ object AlarmAppImproved extends App {
    * prints a dot every second that the alarm is sleeping for, and then
    * prints out a wakeup alarm message, like "Time to wakeup!!!".
    */
-  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
-    ???
+  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] = {
+    val dots = (print(".") *> ZIO.sleep(1.second)).forever
+
+    for {
+      duration <- getAlarmDuration
+      _        <- ZIO.sleep(duration) race dots
+      _        <- printLine("Time to wakeup!!!")
+    } yield ()
+  }.exitCode
 }
 
 /**
@@ -139,14 +147,38 @@ object ComputePi extends App {
   val randomPoint: ZIO[Has[Random], Nothing, (Double, Double)] =
     nextDouble zip nextDouble
 
+  def addPoint(piState: PiState): ZIO[Has[Random], Nothing, Unit] =
+    for {
+      point <- randomPoint
+      _     <- piState.total.update(_ + 1)
+      _     <- piState.inside.update(_ + (if (insideCircle(point._1, point._2)) 1 else 0))
+    } yield ()
+
+  def printEstimate(piState: PiState): ZIO[Has[Console], IOException, Unit] =
+    for {
+      inside <- piState.inside.get
+      total  <- piState.total.get
+      _      <- printLine(s"${estimatePi(inside, total)}")
+    } yield ()
+
   /**
    * EXERCISE
    *
    * Build a multi-fiber program that estimates the value of `pi`. Print out
    * ongoing estimates continuously until the estimation is complete.
    */
-  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
-    ???
+  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] = {
+    for {
+      inside  <- Ref.make(0L)
+      total   <- Ref.make(0L)
+      piState = PiState(inside, total)
+      _       <- printLine("Hit [Enter] wo stop computing pi...")
+      worker  <- addPoint(piState).forever.fork
+      printer <- (printEstimate(piState) *> ZIO.sleep(1.second)).forever.fork
+      _       <- ZIO.blocking(readLine)
+      _       <- worker.interrupt *> printer.interrupt
+    } yield ()
+  }.exitCode
 }
 
 object ParallelZip extends App {
@@ -264,9 +296,7 @@ object StmQueue extends App {
     (for {
       queue <- Queue.bounded[Int](10)
       _     <- ZIO.foreach(0 to 100)(i => queue.offer(i)).fork
-      _ <- ZIO.foreach(0 to 100)(
-            _ => queue.take.flatMap(i => printLine(s"Got: ${i}"))
-          )
+      _     <- ZIO.foreach(0 to 100)(_ => queue.take.flatMap(i => printLine(s"Got: ${i}")))
     } yield ()).exitCode
 }
 
@@ -334,12 +364,11 @@ object StmLunchTime extends App {
     val TableSize = 5
 
     for {
-      attendees <- ZIO.foreach(0 to Attendees)(
-                    i =>
-                      TRef
-                        .make[Attendee.State](Attendee.State.Starving)
-                        .map(Attendee(_))
-                        .commit
+      attendees <- ZIO.foreach(0 to Attendees)(i =>
+                    TRef
+                      .make[Attendee.State](Attendee.State.Starving)
+                      .map(Attendee(_))
+                      .commit
                   )
       table <- TArray
                 .fromIterable(List.fill(TableSize)(false))
@@ -496,10 +525,8 @@ object StmDiningPhilosophers extends App {
     val makeFork = TRef.make[Option[Fork]](Some(Fork))
 
     (for {
-      allForks0 <- STM.foreach(0 to size) { i =>
-                    makeFork
-                  }
-      allForks = allForks0 ++ List(allForks0(0))
+      allForks0 <- STM.foreach(0 to size)(i => makeFork)
+      allForks  = allForks0 ++ List(allForks0(0))
       placements = (allForks zip allForks.drop(1)).map {
         case (l, r) => Placement(l, r)
       }
@@ -527,9 +554,7 @@ object StmDiningPhilosophers extends App {
     val count = 10
 
     def eaters(table: Roundtable): Iterable[ZIO[Has[Console], IOException, Unit]] =
-      (0 to count).map { index =>
-        eat(index, table)
-      }
+      (0 to count).map(index => eat(index, table))
 
     (for {
       table <- setupTable(count)
