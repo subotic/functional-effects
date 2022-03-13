@@ -173,10 +173,11 @@ object ComputePi extends App {
       total   <- Ref.make(0L)
       piState = PiState(inside, total)
       _       <- printLine("Hit [Enter] wo stop computing pi...")
-      worker  <- addPoint(piState).forever.fork
+      worker  <- ZIO.forkAll(List.fill(100)(addPoint(piState).forever)) // fill list with 10 effect copies
       printer <- (printEstimate(piState) *> ZIO.sleep(1.second)).forever.fork
+      fiber   = worker.zip(printer) // create virtual fiber
       _       <- ZIO.blocking(readLine)
-      _       <- worker.interrupt *> printer.interrupt
+      _       <- fiber.interrupt // interrupt worker and printer through virtual fiber
     } yield ()
   }.exitCode
 }
@@ -197,8 +198,12 @@ object ParallelZip extends App {
    * Compute fib(10) and fib(13) in parallel using `ZIO#zipPar`, and display
    * the result.
    */
-  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
-    ???
+  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] = {
+    for {
+      res <- fib(10).zipPar(fib(13))
+      _   <- printLine(res.toString())
+    } yield ()
+  }.exitCode
 }
 
 object StmSwap extends App {
@@ -235,10 +240,39 @@ object StmSwap extends App {
    *
    * Using `STM`, implement a safe version of the swap function.
    */
-  def exampleStm: UIO[Int] = ???
+  def exampleStm: UIO[Int] = {
+    // ZSTM[R, E, A]
+    //  STM[   E, A] = ZSTM[Any, E, A]
+    // USTM[      A] = ZSTM[Any, Nothing, A]
 
-  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
-    exampleRef.map(_.toString).flatMap(printLine(_)).exitCode
+    import zio.stm._
+
+    def swap[A](ref1: TRef[A], ref2: TRef[A]): UIO[Unit] =
+      (for {
+        v1 <- ref1.get
+        v2 <- ref2.get
+        _  <- ref2.set(v1)
+        _  <- ref1.set(v2)
+      } yield ()).commit
+
+    for {
+      ref1   <- TRef.make(100).commit
+      ref2   <- TRef.make(0).commit
+      fiber1 <- swap(ref1, ref2).repeatN(100).fork
+      fiber2 <- swap(ref2, ref1).repeatN(100).fork
+      _      <- (fiber1 zip fiber2).join
+      value  <- (ref1.get zipWith ref2.get)(_ + _).commit
+    } yield value
+  }
+
+  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] = {
+    for {
+      ref <- exampleRef.map(_.toString)
+      _   <- printLine(ref)
+      stm <- exampleStm.map(_.toString)
+      _   <- printLine(stm)
+    } yield ()
+  }.exitCode
 }
 
 object StmLock extends App {
@@ -252,11 +286,18 @@ object StmLock extends App {
    * acquisition, and release methods.
    */
   class Lock private (tref: TRef[Boolean]) {
-    def acquire: UIO[Unit] = ???
-    def release: UIO[Unit] = ???
+    def acquire: UIO[Unit] =
+      (for {
+        acquired <- tref.get
+        _        <- if (acquired) STM.retry else tref.set(true)
+      } yield ()).commit
+
+    def release: UIO[Unit] =
+      tref.set(false).commit
   }
   object Lock {
-    def make: UIO[Lock] = ???
+    def make: UIO[Lock] =
+      TRef.make(false).commit.map(tref => new Lock(tref))
   }
 
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
@@ -285,11 +326,24 @@ object StmQueue extends App {
    * Using STM, implement a async queue with double back-pressuring.
    */
   class Queue[A] private (capacity: Int, queue: TRef[ScalaQueue[A]]) {
-    def take: UIO[A]           = ???
-    def offer(a: A): UIO[Unit] = ???
+    def take: UIO[A] =
+      (for {
+        option <- queue.get.map(_.dequeueOption)
+        a <- option match {
+              case Some((head, tail)) => queue.set(tail).as(head)
+              case None               => STM.retry
+            }
+      } yield a).commit
+
+    def offer(a: A): UIO[Unit] =
+      (for {
+        size <- queue.get.map(_.size)
+        _    <- if (size < capacity) queue.update(_.enqueue(a)) else STM.retry
+      } yield ()).commit
   }
   object Queue {
-    def bounded[A](capacity: Int): UIO[Queue[A]] = ???
+    def bounded[A](capacity: Int): UIO[Queue[A]] =
+      TRef.make(ScalaQueue.empty[A]).commit.map(scalaQueue => new Queue(capacity, scalaQueue))
   }
 
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
