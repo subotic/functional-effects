@@ -45,10 +45,14 @@ object SimpleActor extends ZIOAppDefault {
 
   import zio.stm._
 
+  // actor.tell(message): Unit
+  // actor.ask(message) : Future[Response]
+
   sealed trait Command
   case object ReadTemperature                       extends Command
   final case class AdjustTemperature(value: Double) extends Command
 
+  // the definition of our actor
   type TemperatureActor = Command => Task[Double]
 
   /**
@@ -58,9 +62,36 @@ object SimpleActor extends ZIOAppDefault {
    * actor as a function from `Command` to `Task[Double]`.
    */
   def makeActor(initialTemperature: Double): UIO[TemperatureActor] = {
+
+    import zio.Queue
+
+    // return type of Nothing implies Unendlichkeit
+    def actorLogic(inbox: Queue[Bundle], current: Ref[Double]): UIO[Nothing] =
+      (for {
+        tuple              <- inbox.take
+        (command, promise) = tuple
+        value              <- current.get
+        _ <- command match {
+              case ReadTemperature               => ZIO.unit
+              case AdjustTemperature(adjustment) => current.update(_ + adjustment)
+            }
+        value <- current.get
+        _     <- promise.succeed(value)
+      } yield ()).forever
+
     type Bundle = (Command, Promise[Nothing, Double])
 
-    ???
+    for {
+      current <- Ref.make(initialTemperature)
+      inbox   <- Queue.bounded[Bundle](100)
+      thread  <- actorLogic(inbox, current).fork // will be terminated if the parent fiber is terminated. alternative is .forDeamon
+    } yield (command: Command) =>
+      for {
+        promise <- Promise.make[Nothing, Double]
+        _       <- inbox.offer(command -> promise)
+        value   <- promise.await
+      } yield value
+
   }
 
   val run = {
@@ -68,11 +99,9 @@ object SimpleActor extends ZIOAppDefault {
 
     (for {
       actor <- makeActor(0)
-      _ <- ZIO.foreachPar(temperatures) { temp =>
-            actor(AdjustTemperature(temp))
-          }
-      temp <- actor(ReadTemperature)
-      _    <- Console.printLine(s"Final temperature is ${temp}")
+      _     <- ZIO.foreachPar(temperatures)(temp => actor(AdjustTemperature(temp)))
+      temp  <- actor(ReadTemperature)
+      _     <- Console.printLine(s"Final temperature is ${temp}")
     } yield ())
   }
 }
@@ -122,12 +151,25 @@ object parallel_web_crawler {
     seeds: Set[URL],
     router: URL => Set[URL],
     processor: (URL, String) => IO[E, Unit]
-  ): ZIO[Web with Clock, Nothing, List[E]] = {
+  ): ZIO[Web, Nothing, List[E]] = {
     val emptySet = ZIO.succeed(Set.empty[URL])
 
-    def loop(seeds: Set[URL], ref: Ref[CrawlState[E]]): ZIO[Web with Clock, Nothing, Unit] =
+    def loop(seeds: Set[URL], ref: Ref[CrawlState[E]]): ZIO[Web, Nothing, Unit] =
       if (seeds.isEmpty) ZIO.unit
-      else ???
+      else
+        ZIO
+          .foreachPar(seeds) { seed =>
+            (for {
+              content  <- getURL(seed)
+              _        <- processor(seed, content).catchAll(e => ref.update(_.logError(e)))
+            } yield extractURLs(seed, content).toSet).orElse(ZIO.succeed(Set.empty[URL]))
+          }
+          .map(_.flatten)
+          .flatMap { newSeeds =>
+            ref
+              .modify(state => (newSeeds -- state.visited, state.visitAll(newSeeds)))
+              .flatMap(unvisitedUrls => loop(unvisitedUrls, ref))
+          } @@ ZIOAspect.parallel(10)
 
     for {
       ref   <- Ref.make[CrawlState[E]](CrawlState(seeds, Nil))
